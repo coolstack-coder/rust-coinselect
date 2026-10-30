@@ -32,25 +32,22 @@ pub fn select_coin_fifo(
 
     sorted_inputs.extend(inputs_without_sequence);
 
-    for (index, inputs) in sorted_inputs {
-        estimated_fees =
-            calculate_fee(accumulated_weight, options.target_feerate).unwrap_or_default();
-        if accumulated_value
-            >= (options.target_value
-                + estimated_fees.max(options.min_absolute_fee)
-                + options.min_change_value)
-        {
+    let target = options.target_value + options.min_change_value;
+
+    // Fees are recomputed after every input is added, so the final check below
+    // always accounts for the weight of all the selected inputs.
+    for (index, input) in sorted_inputs {
+        accumulated_value += input.value;
+        accumulated_weight += input.weight;
+        estimated_fees = calculate_fee(accumulated_weight, options.target_feerate)?;
+        selected_inputs.push(index);
+
+        if accumulated_value >= (target + estimated_fees.max(options.min_absolute_fee)) {
             break;
         }
-        accumulated_value += inputs.value;
-        accumulated_weight += inputs.weight;
-        selected_inputs.push(index);
     }
-    if accumulated_value
-        < (options.target_value
-            + estimated_fees.max(options.min_absolute_fee)
-            + options.min_change_value)
-    {
+
+    if accumulated_value < (target + estimated_fees.max(options.min_absolute_fee)) {
         Err(SelectionError::InsufficientFunds)
     } else {
         let waste: u64 = calculate_waste(
@@ -164,9 +161,47 @@ mod test {
         assert!(matches!(result, Err(SelectionError::InsufficientFunds)));
     }
 
+    fn test_fee_of_last_input_is_accounted() {
+        // The second input pushes the accumulated weight to 1100 WU, which costs
+        // 440 sats at 0.4 sat/WU. 3100 < 2500 + 500 + 440, so the selection must
+        // fail instead of succeeding with the fee of the first input only (40 sats).
+        let inputs = [
+            OutputGroup {
+                value: 3000,
+                weight: 100,
+                input_count: 1,
+                creation_sequence: Some(0),
+            },
+            OutputGroup {
+                value: 100,
+                weight: 1000,
+                input_count: 1,
+                creation_sequence: Some(1),
+            },
+        ];
+        let options = setup_options(2500);
+        let result = select_coin_fifo(&inputs, &options);
+        assert!(matches!(result, Err(SelectionError::InsufficientFunds)));
+    }
+
+    fn test_invalid_feerate() {
+        let inputs = setup_basic_output_groups();
+
+        let mut options = setup_options(2500);
+        options.target_feerate = 0.0;
+        let result = select_coin_fifo(&inputs, &options);
+        assert!(matches!(result, Err(SelectionError::NonPositiveFeeRate)));
+
+        options.target_feerate = 1001.0;
+        let result = select_coin_fifo(&inputs, &options);
+        assert!(matches!(result, Err(SelectionError::AbnormallyHighFeeRate)));
+    }
+
     #[test]
     fn test_fifo() {
         test_successful_selection();
         test_insufficient_funds();
+        test_fee_of_last_input_is_accounted();
+        test_invalid_feerate();
     }
 }
